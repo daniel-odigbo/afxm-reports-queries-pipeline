@@ -1,0 +1,128 @@
+WITH dcmm_extract AS (
+    SELECT
+        dcmm.sol_id,
+        dcmm.dc_ref_num,
+        dcmm.dc_reg_type,
+        dcmm.date_opnd,
+        dcmm.expiry_date,
+        dcmm.actl_crncy_code,
+        dcmm.ratecode,
+        dcmm.rate,
+        dcmm.open_value,
+        dcmm.actl_tolerance_pcnt,
+        dcmm.negative_tol_pcnt,
+        dcmm.current_value,
+        dcmm.cont_liab_amt,
+        dcmm.bill_lodg_amt,
+        dcmm.dc_b2kid,
+        dcmm.our_party_limit_b2kid,
+        dcmm.our_party_acid,
+        dcmm.dc_contra_acid,
+        dcmm.dc_const_acid,
+        dcmm.issu_party_code,
+        dcmm.cont_liab_crncy,
+        dcmm.actl_revolving_flg,
+        dcmm.date_clsd,
+        dcrm.inw_out_dc_ind,
+        dcmm.benef_party_code,
+
+        /* Parent Facility */
+        (
+            SELECT l1.limit_prefix || '/' || l1.limit_suffix
+            FROM tbaadm.llt l1
+            WHERE l1.limit_suffix LIKE 'FAC%'
+            CONNECT BY l1.limit_b2kid = PRIOR parent_limit_b2kid
+            START WITH l1.limit_b2kid = dcmm.our_party_limit_b2kid
+        ) parent_id,
+
+        (
+            SELECT l1.limit_prefix
+            FROM tbaadm.llt l1
+            WHERE l1.limit_suffix LIKE 'FAC%'
+            CONNECT BY l1.limit_b2kid = PRIOR parent_limit_b2kid
+            START WITH l1.limit_b2kid = dcmm.our_party_limit_b2kid
+        ) cif_id
+
+    FROM tbaadm.dcmm dcmm
+    JOIN tbaadm.dcrm dcrm
+        ON dcrm.reg_type = dcmm.dc_reg_type
+
+    WHERE dcmm.entity_cre_flg = 'Y'
+      AND NVL(dcmm.del_flg, 'N') <> 'Y'
+      AND dcmm.date_opnd <= (
+            SELECT db_stat_date - 1
+            FROM tbaadm.gct
+      )
+      AND dcmm.date_clsd BETWEEN
+            TRUNC((SELECT db_stat_date - 1 FROM tbaadm.gct), 'MM')
+            AND (SELECT db_stat_date - 1 FROM tbaadm.gct)
+),
+enriched_dcmm AS (
+    SELECT
+        b.*,
+        ext.risk_country_code,
+        ext.sector_being_financed,
+        ext.sub_sector_being_financed,
+        ext.primary_rm,
+        ext.loan_grade,
+        ext.program_loan_type,
+        ext.main_dept,
+        sol.sol_desc region,
+        corp.cust_const,
+        corp.secondrmlogin_id,
+        corp.tertiaryrmlogin_id,
+        clrct.ref_desc program_loan_desc
+    FROM dcmm_extract b
+    LEFT JOIN custom.c_lnm_ext ext
+        ON b.parent_id =
+           ext.limit_prefix || '/' || ext.limit_suffix
+    LEFT JOIN tbaadm.sol sol
+        ON ext.sales_sol_id = sol.sol_id
+    LEFT JOIN crmuser.corporate corp
+        ON b.cif_id = corp.corp_key
+    LEFT JOIN custom.c_lrct clrct
+        ON ext.program_loan_type = clrct.ref_code
+       AND clrct.ref_rec_type = 'LPRGM'
+       AND clrct.del_flg = 'N'
+)
+SELECT
+    e.parent_id,
+    e.sol_id,
+    e.dc_ref_num,
+
+    custom.all_report_functions.get_employee_name(e.primary_rm)
+        AS product_manager_desc,
+
+    custom.all_report_functions.get_rct_desc(
+        e.risk_country_code,
+        '03'
+    ) country,
+
+    CASE
+        WHEN UPPER(
+            custom.all_report_functions.get_crm_clang_desc(
+                e.cust_const,
+                'CONSTITUTION_CODE'
+            )
+        ) IN (
+            'LIMITED LIABILITY COMPANY',
+            'PRIVATE COMPANY LIMITED BY SHARES (LTD)'
+        )
+        THEN 'PRIVATE'
+
+        WHEN UPPER(
+            custom.all_report_functions.get_crm_clang_desc(
+                e.cust_const,
+                'CONSTITUTION_CODE'
+            )
+        ) IN (
+            'CENTRAL BANK',
+            'MINISTRY',
+            'PARASTATAL'
+        )
+        THEN 'SOVEREIGN'
+
+        ELSE 'PUBLIC'
+    END borrower_type
+
+FROM enriched_dcmm e
